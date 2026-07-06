@@ -25,13 +25,18 @@ def create_application() -> Application:
     - Downloads without size limits
     - Sending files via local filesystem paths
     """
-    builder = ApplicationBuilder().token(config.BOT_TOKEN)
+    timeout = config.TELEGRAM_API_TIMEOUT
+    # PTB defaults media_write_timeout to 20s; large video uploads need more headroom.
+    media_timeout = max(timeout, 120.0)
 
     builder = (
-        builder.connect_timeout(config.TELEGRAM_API_TIMEOUT)
-        .read_timeout(config.TELEGRAM_API_TIMEOUT)
-        .write_timeout(config.TELEGRAM_API_TIMEOUT)
-        .pool_timeout(config.TELEGRAM_API_TIMEOUT)
+        ApplicationBuilder()
+        .token(config.BOT_TOKEN)
+        .connect_timeout(timeout)
+        .read_timeout(timeout)
+        .write_timeout(timeout)
+        .pool_timeout(timeout)
+        .media_write_timeout(media_timeout)
     )
 
     if config.TELEGRAM_LOCAL_MODE:
@@ -44,17 +49,19 @@ def create_application() -> Application:
             .local_mode(True)
         )
         logger.info(
-            "Local Bot API enabled: base_url=%s, file_base_url=%s, max_upload=%dMB, timeout=%ss",
+            "Local Bot API enabled: base_url=%s, file_base_url=%s, max_upload=%dMB, timeout=%ss, media_timeout=%ss",
             config.TELEGRAM_API_BASE_URL,
             file_base_url,
             config.TELEGRAM_MAX_UPLOAD_SIZE_MB,
-            config.TELEGRAM_API_TIMEOUT,
+            timeout,
+            media_timeout,
         )
     else:
         logger.info(
-            "Using Telegram cloud API (max upload: %dMB, timeout=%ss)",
+            "Using Telegram cloud API (max upload: %dMB, timeout=%ss, media_timeout=%ss)",
             config.TELEGRAM_MAX_UPLOAD_SIZE_MB,
-            config.TELEGRAM_API_TIMEOUT,
+            timeout,
+            media_timeout,
         )
 
     return builder.build()

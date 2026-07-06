@@ -6,7 +6,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Awaitable, Callable, Iterator, TypeVar
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ChatType
 from telegram.ext import ContextTypes, CallbackQueryHandler, MessageHandler, filters
@@ -165,6 +165,40 @@ async def _download_with_retry(file, destination_path: str, max_retries: int = 3
                 raise
     return False
 
+
+_T = TypeVar("_T")
+
+
+async def _send_with_retry(
+    send_callable: Callable[[], Awaitable[_T]],
+    *,
+    max_retries: int = 3,
+    correlation_id: str | None = None,
+    label: str = "send",
+) -> _T:
+    """Run a Telegram send operation with retry on TimedOut.
+
+    The callable must be safe to call multiple times (re-open file handles
+    on each invocation).
+    """
+    cid = correlation_id or "no-cid"
+
+    for attempt in range(max_retries):
+        try:
+            return await send_callable()
+        except TimedOut as e:
+            if attempt < max_retries - 1:
+                delay = 2 * (attempt + 1)
+                logger.warning(
+                    f"[{cid}] {label} timed out (attempt {attempt + 1}/{max_retries}), "
+                    f"retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                logger.error(f"[{cid}] {label} timed out after {max_retries} attempts: {e}")
+                raise
+
+    raise RuntimeError("unreachable")
 
 
 async def _process_video_with_timeout(
@@ -7150,14 +7184,14 @@ def _get_error_message_for_exception(e: Exception, url: str, correlation_id: str
             logger.error(f"[{correlation_id}] Disk full: {e}")
             return "No hay espacio suficiente en el servidor."
 
-    # Telegram errors
-    if isinstance(e, TelegramNetworkError):
-        logger.warning(f"[{correlation_id}] Telegram network error: {e}")
-        return "Error de red al enviar el archivo, intenta de nuevo."
-
+    # Telegram errors (TimedOut is a NetworkError subclass — check it first)
     if isinstance(e, TelegramTimedOut):
         logger.warning(f"[{correlation_id}] Telegram timeout: {e}")
         return "El envío tardó demasiado, intenta de nuevo."
+
+    if isinstance(e, TelegramNetworkError):
+        logger.warning(f"[{correlation_id}] Telegram network error: {e}")
+        return "Error de red al enviar el archivo, intenta de nuevo."
 
     if isinstance(e, RetryAfter):
         retry_after = getattr(e, 'retry_after', 30)
@@ -8374,45 +8408,51 @@ async def _send_downloaded_file_with_menu(
 
             # Send first batch (up to 10) as media group
             first_batch = file_paths[:10]
-            media_group = []
-            for i, file_path in enumerate(first_batch):
-                file_ext = os.path.splitext(file_path)[1].lower()
-                # Use original caption for first item, include item count
-                if i == 0:
-                    caption = f"{main_caption}\n\n({i+1}/{len(file_paths)})"
-                else:
-                    caption = None
 
-                try:
-                    if file_ext in image_extensions:
-                        media_group.append(InputMediaPhoto(
-                            media=_media_input(file_path),
-                            caption=caption if i == 0 else None
-                        ))
-                    elif file_ext in video_extensions:
-                        media_group.append(InputMediaVideo(
-                            media=_media_input(file_path),
-                            caption=caption if i == 0 else None,
-                            supports_streaming=True
-                        ))
+            def _build_media_group() -> list:
+                media_group = []
+                for i, file_path in enumerate(first_batch):
+                    file_ext = os.path.splitext(file_path)[1].lower()
+                    if i == 0:
+                        caption = f"{main_caption}\n\n({i+1}/{len(file_paths)})"
                     else:
-                        # Audio or unknown - add as photo for now (fallback)
-                        media_group.append(InputMediaPhoto(
-                            media=_media_input(file_path),
-                            caption=caption if i == 0 else None
-                        ))
-                except Exception as file_err:
-                    logger.warning(f"[{correlation_id}] Failed to add file {file_path}: {file_err}")
+                        caption = None
+
+                    try:
+                        if file_ext in image_extensions:
+                            media_group.append(InputMediaPhoto(
+                                media=_media_input(file_path),
+                                caption=caption if i == 0 else None
+                            ))
+                        elif file_ext in video_extensions:
+                            media_group.append(InputMediaVideo(
+                                media=_media_input(file_path),
+                                caption=caption if i == 0 else None,
+                                supports_streaming=True
+                            ))
+                        else:
+                            media_group.append(InputMediaPhoto(
+                                media=_media_input(file_path),
+                                caption=caption if i == 0 else None
+                            ))
+                    except Exception as file_err:
+                        logger.warning(f"[{correlation_id}] Failed to add file {file_path}: {file_err}")
+                return media_group
 
             has_video_menu = False
-            if media_group:
-                sent_messages = await message.reply_media_group(
-                    media=media_group
+            built_group = _build_media_group()
+            if built_group:
+                async def _send_group():
+                    return await message.reply_media_group(media=_build_media_group())
+
+                sent_messages = await _send_with_retry(
+                    _send_group,
+                    correlation_id=correlation_id,
+                    label="reply_media_group",
                 )
                 logger.info(f"[{correlation_id}] Sent media group with {len(sent_messages)} items")
 
-                # Check if we need to show video menu
-                first_video = next((m for m in media_group if isinstance(m, InputMediaVideo)), None)
+                first_video = next((m for m in built_group if isinstance(m, InputMediaVideo)), None)
                 if first_video:
                     has_video_menu = True
 
@@ -8426,34 +8466,55 @@ async def _send_downloaded_file_with_menu(
 
                     try:
                         if file_ext in image_extensions:
-                            with _open_file_for_send(file_path) as photo_file:
-                                await message.reply_photo(
-                                    photo=photo_file,
-                                    caption=item_caption
-                                )
+                            async def _send_photo(fp=file_path, cap=item_caption):
+                                with _open_file_for_send(fp) as photo_file:
+                                    return await message.reply_photo(photo=photo_file, caption=cap)
+
+                            await _send_with_retry(
+                                _send_photo,
+                                correlation_id=correlation_id,
+                                label="reply_photo",
+                            )
                         elif file_ext in video_extensions:
-                            with _open_file_for_send(file_path) as video_file:
-                                sent_msg = await message.reply_video(
-                                    video=video_file,
-                                    caption=item_caption,
-                                    supports_streaming=True
-                                )
+                            async def _send_video(fp=file_path, cap=item_caption):
+                                with _open_file_for_send(fp) as video_file:
+                                    return await message.reply_video(
+                                        video=video_file,
+                                        caption=cap,
+                                        supports_streaming=True,
+                                    )
+
+                            await _send_with_retry(
+                                _send_video,
+                                correlation_id=correlation_id,
+                                label="reply_video",
+                            )
                             has_video_menu = True
                         elif file_ext in audio_extensions:
-                            with _open_file_for_send(file_path) as audio_file:
-                                await message.reply_audio(
-                                    audio=audio_file,
-                                    caption=item_caption,
-                                    title=title,
-                                    performer=metadata.get('artist') or metadata.get('uploader')
-                                )
+                            async def _send_audio(fp=file_path, cap=item_caption):
+                                with _open_file_for_send(fp) as audio_file:
+                                    return await message.reply_audio(
+                                        audio=audio_file,
+                                        caption=cap,
+                                        title=title,
+                                        performer=metadata.get('artist') or metadata.get('uploader'),
+                                    )
+
+                            await _send_with_retry(
+                                _send_audio,
+                                correlation_id=correlation_id,
+                                label="reply_audio",
+                            )
                         else:
-                            # Fallback: send as document
-                            with _open_file_for_send(file_path) as doc_file:
-                                await message.reply_document(
-                                    document=doc_file,
-                                    caption=item_caption
-                                )
+                            async def _send_document(fp=file_path, cap=item_caption):
+                                with _open_file_for_send(fp) as doc_file:
+                                    return await message.reply_document(document=doc_file, caption=cap)
+
+                            await _send_with_retry(
+                                _send_document,
+                                correlation_id=correlation_id,
+                                label="reply_document",
+                            )
                     except Exception as file_err:
                         logger.warning(f"[{correlation_id}] Failed to send remaining file {file_path}: {file_err}")
 
@@ -8490,29 +8551,44 @@ async def _send_downloaded_file_with_menu(
                     part_caption = main_caption
 
                 if format_type == 'audio' or file_ext in audio_extensions:
-                    # Send as audio
-                    with _open_file_for_send(part_path) as audio_file:
-                        await message.reply_audio(
-                            audio=audio_file,
-                            caption=part_caption,
-                            title=title,
-                            performer=metadata.get('artist') or metadata.get('uploader')
-                        )
+                    async def _send_audio(pp=part_path, cap=part_caption):
+                        with _open_file_for_send(pp) as audio_file:
+                            return await message.reply_audio(
+                                audio=audio_file,
+                                caption=cap,
+                                title=title,
+                                performer=metadata.get('artist') or metadata.get('uploader'),
+                            )
+
+                    await _send_with_retry(
+                        _send_audio,
+                        correlation_id=correlation_id,
+                        label="reply_audio",
+                    )
                 elif file_ext in image_extensions:
-                    # Send as photo
-                    with _open_file_for_send(part_path) as photo_file:
-                        await message.reply_photo(
-                            photo=photo_file,
-                            caption=part_caption
-                        )
+                    async def _send_photo(pp=part_path, cap=part_caption):
+                        with _open_file_for_send(pp) as photo_file:
+                            return await message.reply_photo(photo=photo_file, caption=cap)
+
+                    await _send_with_retry(
+                        _send_photo,
+                        correlation_id=correlation_id,
+                        label="reply_photo",
+                    )
                 else:
-                    # Send as video
-                    with _open_file_for_send(part_path) as video_file:
-                        sent_message = await message.reply_video(
-                            video=video_file,
-                            caption=part_caption,
-                            supports_streaming=True
-                        )
+                    async def _send_video(pp=part_path, cap=part_caption):
+                        with _open_file_for_send(pp) as video_file:
+                            return await message.reply_video(
+                                video=video_file,
+                                caption=cap,
+                                supports_streaming=True,
+                            )
+
+                    sent_message = await _send_with_retry(
+                        _send_video,
+                        correlation_id=correlation_id,
+                        label="reply_video",
+                    )
 
                     # Show post-download menu only for last video part
                     if i == num_parts - 1:
@@ -9196,32 +9272,32 @@ async def send_downloaded_file(
             image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
             video_extensions = {'.mp4', '.webm', '.mov', '.avi', '.mkv'}
 
-            media_group = []
-            for i, file_path in enumerate(file_paths[:10]):
-                file_ext = os.path.splitext(file_path)[1].lower()
-                # Use original caption for first item, include item count
-                if i == 0:
-                    caption = f"{main_caption}\n\n({i+1}/{len(file_paths)})"
-                else:
-                    caption = None
+            batch = file_paths[:10]
 
-                try:
-                    if file_ext in image_extensions:
-                        media_group.append(InputMediaPhoto(
-                            media=open(file_path, 'rb'),
-                            caption=caption if i == 0 else None
-                        ))
-                    elif file_ext in video_extensions:
-                        media_group.append(InputMediaVideo(
-                            media=open(file_path, 'rb'),
-                            caption=caption if i == 0 else None,
-                            supports_streaming=True
-                        ))
-                except Exception as file_err:
-                    logger.warning(f"Failed to add file {file_path}: {file_err}")
+            def _build_legacy_media_group():
+                group = []
+                for i, file_path in enumerate(batch):
+                    file_ext = os.path.splitext(file_path)[1].lower()
+                    caption = f"{main_caption}\n\n({i+1}/{len(file_paths)})" if i == 0 else None
+                    try:
+                        if file_ext in image_extensions:
+                            group.append(InputMediaPhoto(media=open(file_path, 'rb'), caption=caption))
+                        elif file_ext in video_extensions:
+                            group.append(InputMediaVideo(
+                                media=open(file_path, 'rb'),
+                                caption=caption,
+                                supports_streaming=True,
+                            ))
+                    except Exception as file_err:
+                        logger.warning(f"Failed to add file {file_path}: {file_err}")
+                return group
 
-            if media_group:
-                await update.message.reply_media_group(media=media_group)
+            built_group = _build_legacy_media_group()
+            if built_group:
+                async def _send_group():
+                    return await update.message.reply_media_group(media=_build_legacy_media_group())
+
+                await _send_with_retry(_send_group, label="reply_media_group")
                 logger.info(f"Downloaded media group sent to user {update.effective_user.id}")
             else:
                 await update.message.reply_text("Error: No se pudieron procesar los archivos.")
@@ -9232,20 +9308,26 @@ async def send_downloaded_file(
             audio_extensions = {'.mp3', '.aac', '.wav', '.ogg', '.flac', '.m4a', '.opus'}
 
             if file_ext in audio_extensions:
-                with open(file_path, 'rb') as audio_file:
-                    await update.message.reply_audio(
-                        audio=audio_file,
-                        caption=main_caption,
-                        title=title,
-                        performer=metadata.get('artist') or metadata.get('uploader')
-                    )
+                async def _send_audio():
+                    with open(file_path, 'rb') as audio_file:
+                        return await update.message.reply_audio(
+                            audio=audio_file,
+                            caption=main_caption,
+                            title=title,
+                            performer=metadata.get('artist') or metadata.get('uploader'),
+                        )
+
+                await _send_with_retry(_send_audio, label="reply_audio")
             else:
-                with open(file_path, 'rb') as video_file:
-                    await update.message.reply_video(
-                        video=video_file,
-                        caption=main_caption,
-                        supports_streaming=True
-                    )
+                async def _send_video():
+                    with open(file_path, 'rb') as video_file:
+                        return await update.message.reply_video(
+                            video=video_file,
+                            caption=main_caption,
+                            supports_streaming=True,
+                        )
+
+                await _send_with_retry(_send_video, label="reply_video")
             logger.info(f"Downloaded file sent to user {update.effective_user.id}")
     except Exception as e:
         logger.error(f"Failed to send downloaded file(s): {e}")

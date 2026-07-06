@@ -35,6 +35,7 @@ class TestTelegramClient:
         mock_builder.read_timeout.return_value = mock_builder
         mock_builder.write_timeout.return_value = mock_builder
         mock_builder.pool_timeout.return_value = mock_builder
+        mock_builder.media_write_timeout.return_value = mock_builder
         mock_builder.build.return_value = MagicMock()
         mock_builder_cls.return_value = mock_builder
 
@@ -48,6 +49,7 @@ class TestTelegramClient:
         mock_builder.read_timeout.assert_called_once_with(45.0)
         mock_builder.write_timeout.assert_called_once_with(45.0)
         mock_builder.pool_timeout.assert_called_once_with(45.0)
+        mock_builder.media_write_timeout.assert_called_once_with(120.0)
 
     @patch("bot.telegram_client.ApplicationBuilder")
     def test_local_mode_configures_base_url_and_timeouts(self, mock_builder_cls):
@@ -60,6 +62,7 @@ class TestTelegramClient:
         mock_builder.read_timeout.return_value = mock_builder
         mock_builder.write_timeout.return_value = mock_builder
         mock_builder.pool_timeout.return_value = mock_builder
+        mock_builder.media_write_timeout.return_value = mock_builder
         mock_builder.build.return_value = MagicMock()
         mock_builder_cls.return_value = mock_builder
 
@@ -73,3 +76,4 @@ class TestTelegramClient:
         mock_builder.read_timeout.assert_called_once_with(45.0)
         mock_builder.write_timeout.assert_called_once_with(45.0)
         mock_builder.pool_timeout.assert_called_once_with(45.0)
+        mock_builder.media_write_timeout.assert_called_once_with(120.0)
